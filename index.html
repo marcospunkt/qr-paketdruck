@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>QR Paketdruck</title>
+<script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<style>
+  :root { --bg:#f4f4f2; --card:#fff; --fg:#1c1c1c; --muted:#6b6b6b; --accent:#0a7d74; --err:#b3261e; --line:#e2e2de; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#141414; --card:#1f1f1f; --fg:#eee; --muted:#9a9a9a; --accent:#3cbfb2; --err:#ff8a80; --line:#333; } }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.4 -apple-system, system-ui, sans-serif; }
+  main { max-width:480px; margin:0 auto; padding:16px 16px 40px; }
+  h1 { font-size:22px; margin:8px 0 16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:14px; margin-bottom:12px; }
+  .row { display:flex; gap:8px; align-items:center; }
+  button, .file { appearance:none; border:0; border-radius:10px; padding:12px 14px; font:inherit; font-weight:600; background:var(--accent); color:#fff; cursor:pointer; text-align:center; flex:1; }
+  button.secondary, .file.secondary { background:transparent; color:var(--accent); border:1.5px solid var(--accent); }
+  button:disabled { opacity:.45; }
+  .file input { display:none; }
+  label.f { display:block; font-size:14px; color:var(--muted); margin:10px 0 4px; }
+  input[type=text] { width:100%; padding:10px; border-radius:8px; border:1px solid var(--line); background:var(--bg); color:var(--fg); font:inherit; }
+  input[type=range] { width:100%; }
+  #status { font-size:14px; color:var(--muted); min-height:20px; margin-top:8px; }
+  #status.err { color:var(--err); }
+  #preview { display:block; width:100%; max-width:384px; margin:0 auto; background:#fff; image-rendering:pixelated; border:1px dashed var(--line); }
+  .small { font-size:13px; color:var(--muted); }
+  .data { word-break:break-all; font-family:ui-monospace, Menlo, monospace; font-size:12px; color:var(--muted); }
+  .bar { height:6px; background:var(--line); border-radius:3px; overflow:hidden; margin-top:8px; }
+  .bar > div { height:100%; width:0; background:var(--accent); transition:width .1s; }
+</style>
+</head>
+<body>
+<main>
+  <h1>QR-Code aufs Paket</h1>
+
+  <div class="card">
+    <div class="row">
+      <button id="connect">Drucker verbinden</button>
+    </div>
+    <div id="status">Nicht verbunden.</div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <label class="file">Screenshot / PDF wählen<input id="file" type="file" accept="image/*,application/pdf"></label>
+    </div>
+    <p class="small">Screenshot vom QR-Code in der Vinted-App oder das Versand-PDF. Der QR-Code wird automatisch erkannt und scharf neu gezeichnet.</p>
+    <div id="decoded" class="data"></div>
+
+    <label class="f" for="caption">Text unter dem Code (optional)</label>
+    <input id="caption" type="text" placeholder="z. B. Bestellnr. oder Empfänger">
+
+    <label class="f" for="size">Größe: <span id="sizeVal"></span> mm</label>
+    <input id="size" type="range" min="25" max="48" step="1" value="48">
+
+    <label class="f" for="energy">Schwärze: <span id="energyVal"></span></label>
+    <input id="energy" type="range" min="8192" max="28672" step="1024" value="12288">
+  </div>
+
+  <div class="card">
+    <canvas id="preview" width="384" height="384"></canvas>
+    <div class="bar"><div id="progress"></div></div>
+    <div class="row" style="margin-top:12px">
+      <button id="print" disabled>Drucken</button>
+    </div>
+  </div>
+
+  <p class="small">Läuft in Bluefy (iPhone) oder Chrome (Mac/Android). Safari unterstützt kein Web Bluetooth.</p>
+</main>
+
+<script>
+"use strict";
+// ---------- Printer protocol (from Fun Print app, verified with funprint.py) ----------
+const WIDTH = 384, DOTS_PER_MM = 8;
+const SVC = 0xae30, CH_WRITE = 0xae01, CH_NOTIFY = 0xae02;
+const LATTICE_START = [0xaa,0x55,0x17,0x38,0x44,0x5f,0x5f,0x5f,0x44,0x38,0x2c];
+const LATTICE_END   = [0xaa,0x55,0x17,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x17,0x11];
+
+function crc8(data) {
+  let crc = 0;
+  for (const b of data) {
+    crc ^= b;
+    for (let i = 0; i < 8; i++) crc = crc & 0x80 ? ((crc << 1) ^ 0x07) & 0xff : (crc << 1) & 0xff;
+  }
+  return crc;
+}
+function frame(cmd, data) {
+  const n = data.length;
+  return [0x51, 0x78, cmd, 0x00, n & 0xff, n >> 8, ...data, crc8(data), 0xff];
+}
+function buildJob(canvas, energy) {
+  const ctx = canvas.getContext("2d");
+  const { data } = ctx.getImageData(0, 0, WIDTH, canvas.height);
+  const job = [];
+  job.push(...frame(0xa3, [0x00]));
+  job.push(...frame(0xa4, [0x34]));
+  job.push(...frame(0xa6, LATTICE_START));
+  job.push(...frame(0xaf, [energy & 0xff, energy >> 8]));
+  job.push(...frame(0xbe, [0x00]));
+  job.push(...frame(0xbd, [25]));
+  for (let y = 0; y < canvas.height; y++) {
+    const row = new Array(WIDTH / 8).fill(0);
+    for (let x = 0; x < WIDTH; x++) {
+      const i = (y * WIDTH + x) * 4;
+      const lum = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+      if (lum < 128) row[x >> 3] |= 1 << (x & 7); // threshold, no dithering (QR must stay crisp)
+    }
+    job.push(...frame(0xa2, row));
+  }
+  job.push(...frame(0xa1, [80, 0]));
+  job.push(...frame(0xa6, LATTICE_END));
+  job.push(...frame(0xa3, [0x00]));
+  return new Uint8Array(job);
+}
+
+// ---------- UI state ----------
+const $ = (id) => document.getElementById(id);
+let qrText = null, device = null, writeCh = null, canWrite = true, busy = false;
+
+function status(msg, err = false) { $("status").textContent = msg; $("status").className = err ? "err" : ""; }
+
+// ---------- QR detection ----------
+async function loadToCanvas(file) {
+  const c = document.createElement("canvas"), ctx = c.getContext("2d", { willReadFrequently: true });
+  if (file.type === "application/pdf") {
+    pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+    const pdf = await pdfjsLib.getDocument({ data: await file.arrayBuffer() }).promise;
+    const pages = [];
+    for (let p = 1; p <= Math.min(pdf.numPages, 3); p++) {
+      const page = await pdf.getPage(p), vp = page.getViewport({ scale: 3 });
+      const pc = document.createElement("canvas"); pc.width = vp.width; pc.height = vp.height;
+      const pctx = pc.getContext("2d", { willReadFrequently: true });
+      pctx.fillStyle = "#fff"; pctx.fillRect(0, 0, pc.width, pc.height);
+      await page.render({ canvasContext: pctx, viewport: vp }).promise;
+      pages.push(pc);
+    }
+    return pages;
+  }
+  const img = await createImageBitmap(file);
+  c.width = img.width; c.height = img.height; ctx.drawImage(img, 0, 0);
+  return [c];
+}
+function findQR(canvas) {
+  // try full image, then downscaled versions (jsQR is faster/more robust on moderate sizes)
+  for (const maxSide of [0, 1600, 1000, 700]) {
+    let c = canvas;
+    if (maxSide && Math.max(canvas.width, canvas.height) > maxSide) {
+      const s = maxSide / Math.max(canvas.width, canvas.height);
+      c = document.createElement("canvas"); c.width = Math.round(canvas.width * s); c.height = Math.round(canvas.height * s);
+      c.getContext("2d").drawImage(canvas, 0, 0, c.width, c.height);
+    } else if (maxSide) continue;
+    const d = c.getContext("2d", { willReadFrequently: true }).getImageData(0, 0, c.width, c.height);
+    const r = jsQR(d.data, d.width, d.height, { inversionAttempts: "attemptBoth" });
+    if (r && r.data) return r.data;
+  }
+  return null;
+}
+async function handleFile(file) {
+  status("Suche QR-Code …");
+  try {
+    const canvases = await loadToCanvas(file);
+    let found = null;
+    for (const c of canvases) { found = findQR(c); if (found) break; }
+    if (!found) { qrText = null; render(); status("Kein QR-Code gefunden. Screenshot näher am Code versuchen.", true); return; }
+    qrText = found;
+    $("decoded").textContent = "Inhalt: " + found;
+    render();
+    status(writeCh ? "Bereit zum Drucken." : "QR erkannt. Jetzt Drucker verbinden.");
+  } catch (e) { status("Fehler beim Lesen: " + e.message, true); }
+}
+
+// ---------- Rendering ----------
+function render() {
+  const cv = $("preview"), ctx = cv.getContext("2d");
+  const caption = $("caption").value.trim();
+  const sizeMm = +$("size").value; $("sizeVal").textContent = sizeMm;
+  $("energyVal").textContent = "0x" + (+$("energy").value).toString(16);
+  if (!qrText) { cv.height = 384; ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, WIDTH, 384); updateButtons(); return; }
+
+  let qr = null;
+  for (const ecl of ["M", "L"]) { try { qr = qrcode(0, ecl); qr.addData(qrText); qr.make(); break; } catch (e) { qr = null; } }
+  const n = qr.getModuleCount();
+  const target = Math.min(WIDTH, sizeMm * DOTS_PER_MM);
+  const cell = Math.max(1, Math.floor(target / (n + 4)));   // integer dots per module, 2-module quiet zone each side
+  const qrPx = cell * n, top = 2 * cell;
+  const fontPx = 26, lines = caption ? wrap(ctx, caption, fontPx) : [];
+  cv.height = top + qrPx + 2 * cell + lines.length * (fontPx + 6) + (lines.length ? 8 : 0);
+  ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, WIDTH, cv.height);
+  const left = Math.floor((WIDTH - qrPx) / 2);
+  ctx.fillStyle = "#000";
+  for (let r = 0; r < n; r++) for (let c = 0; c < n; c++) if (qr.isDark(r, c)) ctx.fillRect(left + c * cell, top + r * cell, cell, cell);
+  ctx.font = `600 ${fontPx}px -apple-system, system-ui, sans-serif`; ctx.textAlign = "center"; ctx.textBaseline = "top";
+  lines.forEach((l, i) => ctx.fillText(l, WIDTH / 2, top + qrPx + 2 * cell + i * (fontPx + 6)));
+  updateButtons();
+}
+function wrap(ctx, text, fontPx) {
+  ctx.font = `600 ${fontPx}px -apple-system, system-ui, sans-serif`;
+  const out = []; let cur = "";
+  for (const w of text.split(/\s+/)) {
+    const t = cur ? cur + " " + w : w;
+    if (ctx.measureText(t).width > WIDTH - 12 && cur) { out.push(cur); cur = w; } else cur = t;
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+function updateButtons() { $("print").disabled = !(qrText && writeCh) || busy; }
+
+// ---------- Bluetooth ----------
+async function connect() {
+  if (!navigator.bluetooth) { status("Dieser Browser kann kein Bluetooth. Auf dem iPhone die App „Bluefy“ nutzen.", true); return; }
+  try {
+    status("Wähle den Drucker …");
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ services: [SVC] }, { namePrefix: "MX" }, { namePrefix: "GT" }, { namePrefix: "YT" }, { namePrefix: "GB" }],
+      optionalServices: [SVC],
+    });
+    device.addEventListener("gattserverdisconnected", () => { writeCh = null; status("Verbindung getrennt."); $("connect").textContent = "Drucker verbinden"; updateButtons(); });
+    status("Verbinde mit " + device.name + " …");
+    const server = await device.gatt.connect();
+    const svc = await server.getPrimaryService(SVC);
+    writeCh = await svc.getCharacteristic(CH_WRITE);
+    try {
+      const nc = await svc.getCharacteristic(CH_NOTIFY);
+      await nc.startNotifications();
+      nc.addEventListener("characteristicvaluechanged", onNotify);
+    } catch (e) { /* notify optional */ }
+    $("connect").textContent = "Verbunden: " + device.name;
+    status(qrText ? "Bereit zum Drucken." : "Verbunden. Jetzt Screenshot wählen.");
+    updateButtons();
+  } catch (e) { status("Verbindung fehlgeschlagen: " + e.message, true); }
+}
+function onNotify(ev) {
+  const v = new Uint8Array(ev.target.value.buffer);
+  const hex = [...v].map((b) => b.toString(16).padStart(2, "0")).join("");
+  if (hex === "5178ae0101001070ff") canWrite = false;
+  else if (hex === "5178ae0101000000ff") canWrite = true;
+  else if (v.length >= 7 && v[2] === 0xa3) {
+    const msg = { 0x01: "Kein Papier!", 0x09: "Kein Papier!", 0x04: "Drucker überhitzt!", 0x08: "Akku schwach!" }[v[6]];
+    if (msg) status(msg, true);
+  }
+}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function send(bytes) {
+  let chunk = 100;
+  for (let i = 0; i < bytes.length; ) {
+    while (!canWrite) await sleep(20);
+    const part = bytes.slice(i, i + chunk);
+    try {
+      if (writeCh.writeValueWithoutResponse) await writeCh.writeValueWithoutResponse(part);
+      else await writeCh.writeValue(part);
+      i += part.length;
+    } catch (e) {
+      if (chunk > 20) { chunk = 20; continue; } // fall back to minimal BLE packet size
+      throw e;
+    }
+    $("progress").style.width = Math.round((i / bytes.length) * 100) + "%";
+    await sleep(15);
+  }
+}
+async function print() {
+  if (!writeCh || !qrText) return;
+  busy = true; updateButtons(); canWrite = true;
+  try {
+    status("Drucke …");
+    await send(buildJob($("preview"), +$("energy").value));
+    status("Gedruckt.");
+  } catch (e) { status("Druckfehler: " + e.message, true); }
+  busy = false; updateButtons();
+  setTimeout(() => ($("progress").style.width = "0"), 1500);
+}
+
+$("connect").onclick = connect;
+$("print").onclick = print;
+$("file").onchange = (e) => e.target.files[0] && handleFile(e.target.files[0]);
+["caption", "size", "energy"].forEach((id) => $(id).addEventListener("input", render));
+window.__test = { handleFile, buildJob }; // for automated testing
+render();
+</script>
+</body>
+</html>
