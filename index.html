@@ -40,6 +40,10 @@
     <div class="row">
       <button id="connect">Drucker verbinden</button>
     </div>
+    <div class="row" style="margin-top:8px">
+      <button id="connectAll" class="secondary">Alle Geräte anzeigen</button>
+    </div>
+    <p class="small">Taucht der Drucker nicht auf? „Alle Geräte anzeigen“ nutzen und „MX06“ (oder ein unbenanntes Gerät) wählen.</p>
     <div id="status">Nicht verbunden.</div>
   </div>
 
@@ -209,18 +213,23 @@ function wrap(ctx, text, fontPx) {
 function updateButtons() { $("print").disabled = !(qrText && writeCh) || busy; }
 
 // ---------- Bluetooth ----------
-async function connect() {
+const SVC_FULL = "0000ae30-0000-1000-8000-00805f9b34fb";
+async function connect(showAll) {
   if (!navigator.bluetooth) { status("Dieser Browser kann kein Bluetooth. Auf dem iPhone die App „Bluefy“ nutzen.", true); return; }
   try {
     status("Wähle den Drucker …");
-    device = await navigator.bluetooth.requestDevice({
-      filters: [{ services: [SVC] }, { namePrefix: "MX" }, { namePrefix: "GT" }, { namePrefix: "YT" }, { namePrefix: "GB" }],
-      optionalServices: [SVC],
-    });
+    device = await navigator.bluetooth.requestDevice(showAll === true
+      ? { acceptAllDevices: true, optionalServices: [SVC_FULL] }
+      : {
+          filters: [{ namePrefix: "MX" }, { namePrefix: "GT" }, { namePrefix: "YT" }, { namePrefix: "GB" }, { services: [SVC_FULL] }],
+          optionalServices: [SVC_FULL],
+        });
     device.addEventListener("gattserverdisconnected", () => { writeCh = null; status("Verbindung getrennt."); $("connect").textContent = "Drucker verbinden"; updateButtons(); });
     status("Verbinde mit " + device.name + " …");
     const server = await device.gatt.connect();
-    const svc = await server.getPrimaryService(SVC);
+    let svc;
+    try { svc = await server.getPrimaryService(SVC_FULL); }
+    catch (e) { device.gatt.disconnect(); throw new Error(`„${device.name || "Gerät"}“ ist kein unterstützter Drucker (kein Dienst AE30).`); }
     writeCh = await svc.getCharacteristic(CH_WRITE);
     try {
       const nc = await svc.getCharacteristic(CH_NOTIFY);
@@ -272,7 +281,8 @@ async function print() {
   setTimeout(() => ($("progress").style.width = "0"), 1500);
 }
 
-$("connect").onclick = connect;
+$("connect").onclick = () => connect(false);
+$("connectAll").onclick = () => connect(true);
 $("print").onclick = print;
 $("file").onchange = (e) => e.target.files[0] && handleFile(e.target.files[0]);
 ["caption", "size", "energy"].forEach((id) => $(id).addEventListener("input", render));
