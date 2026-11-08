@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>QR Paketdruck</title>
 <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/zxing-wasm@2.2.4/dist/iife/reader/index.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/zxing-wasm@2.2.4/dist/iife/full/index.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 <style>
@@ -54,6 +54,8 @@
     </div>
     <p class="small">Screenshot oder Foto vom QR-Code bzw. das Versand-PDF. Der QR-Code wird automatisch erkannt und scharf neu gezeichnet. Fotos: Code möglichst gerade und formatfüllend, ohne Spiegelung.</p>
     <div id="decoded" class="data"></div>
+
+    <label class="f" style="display:flex;gap:8px;align-items:center"><input id="showCarrier" type="checkbox" checked> Versanddienst (z. B. DHL) groß über den Code drucken</label>
 
     <label class="f" for="caption">Text unter dem Code (optional)</label>
     <input id="caption" type="text" placeholder="z. B. Bestellnr. oder Empfänger">
@@ -125,7 +127,7 @@ function buildJob(canvas, energy) {
 
 // ---------- UI state ----------
 const $ = (id) => document.getElementById(id);
-let qrText = null, device = null, writeCh = null, canWrite = true, busy = false;
+let code = null, device = null, writeCh = null, canWrite = true, busy = false;
 
 function status(msg, err = false) { $("status").textContent = msg; $("status").className = err ? "err" : ""; }
 
@@ -172,47 +174,98 @@ let zxingReady = null;
 function zxing() {
   if (!zxingReady && window.ZXingWASM) {
     ZXingWASM.prepareZXingModule({
-      overrides: { locateFile: (p, prefix) => p.endsWith(".wasm") ? "https://cdn.jsdelivr.net/npm/zxing-wasm@2.2.4/dist/reader/zxing_reader.wasm" : prefix + p },
+      overrides: { locateFile: (p, prefix) => p.endsWith(".wasm") ? "https://cdn.jsdelivr.net/npm/zxing-wasm@2.2.4/dist/full/zxing_full.wasm" : prefix + p },
     });
     zxingReady = Promise.resolve(ZXingWASM);
   }
   return zxingReady;
 }
+const FORMATS = ["QRCode", "Aztec", "DataMatrix"];
+// Returns { text, format } or null.
 async function findQR(canvas) {
-  // 1) zxing-cpp (WASM): robust against perspective, blur, glare and big photos
+  // 1) zxing-cpp (WASM): robust against perspective, blur, glare and big photos; reads QR, Aztec (DPD), DataMatrix
   try {
     const Z = await zxing();
     if (Z) {
       for (const maxSide of [2000, 1200, 3000]) {
         for (const [x, y, w, h] of CROPS) {
-          const res = await Z.readBarcodes(sub(canvas, x, y, w, h, maxSide), { formats: ["QRCode"], tryHarder: true, tryRotate: true, tryInvert: true, maxNumberOfSymbols: 1 });
+          const res = await Z.readBarcodes(sub(canvas, x, y, w, h, maxSide), { formats: FORMATS, tryHarder: true, tryRotate: true, tryInvert: true, maxNumberOfSymbols: 1 });
           const hit = res.find((r) => r.isValid && r.text);
-          if (hit) return hit.text;
+          if (hit) return { text: hit.text, format: hit.format };
         }
       }
     }
   } catch (e) { console.warn("zxing failed, falling back to jsQR", e); }
-  // 2) jsQR fallback on several sizes and centre crops
+  // 2) jsQR fallback (QR only) on several sizes and centre crops
   for (const maxSide of [1000, 700, 1400, 500]) {
     for (const [x, y, w, h] of CROPS) {
       const d = sub(canvas, x, y, w, h, maxSide);
       const r = jsQR(d.data, d.width, d.height, { inversionAttempts: "attemptBoth" });
-      if (r && r.data) return r.data;
+      if (r && r.data) return { text: r.data, format: "QRCode" };
     }
   }
   return null;
 }
+
+// ---------- Carrier detection (patterns from real Vinted codes) ----------
+function detectCarrier(text, format) {
+  const t = text.trim();
+  if (/^\.?\d?RJD01|\|JD01\d{6,}/i.test(t) || /dhl\s*express/i.test(t)) return "DHL EXPRESS";   // ".5RJD01:|01.00|<AWB>|JD01…"
+  if (/^OF\|/.test(t) || /\|DHL Paket/i.test(t) || /dhl/i.test(t)) return "DHL";               // "OF|…|DHL Paket Vinted|…"
+  if (/dpd/i.test(t) || format === "Aztec") return "DPD";                                        // DPD Shop2Shop uses Aztec
+  if (/hermes/i.test(t)) return "HERMES";
+  if (/\bgls\b/i.test(t)) return "GLS";
+  if (/\bups\b/i.test(t)) return "UPS";
+  return null;
+}
+
+// ---------- Module matrix of the clean, re-encoded symbol ----------
+async function buildMatrix(text, format) {
+  if (format === "QRCode") {
+    for (const ecl of ["M", "L", "Q", "H"]) {
+      try {
+        const qr = qrcode(0, ecl); qr.addData(text, "Byte"); qr.make();
+        const n = qr.getModuleCount();
+        return { w: n, h: n, dark: (r, c) => qr.isDark(r, c), quiet: 2 };
+      } catch (e) { /* too long for this level */ }
+    }
+    throw new Error("QR-Inhalt zu lang");
+  }
+  const Z = await zxing();
+  const out = await Z.writeBarcode(text, { format, scale: 1 });
+  if (out.error) throw new Error(out.error);
+  const bm = await createImageBitmap(out.image);
+  const c = document.createElement("canvas"); c.width = bm.width; c.height = bm.height;
+  const ctx = c.getContext("2d", { willReadFrequently: true }); ctx.drawImage(bm, 0, 0);
+  const d = ctx.getImageData(0, 0, c.width, c.height).data, w = c.width;
+  return { w: c.width, h: c.height, dark: (r, col) => d[(r * w + col) * 4] < 128, quiet: format === "Aztec" ? 1 : 1 };
+}
+// Draw matrix into a canvas and read it back: guarantees the printed code carries the same content.
+async function verifyMatrix(m, text) {
+  const cell = 4, q = 4, c = document.createElement("canvas");
+  c.width = (m.w + 2 * q) * cell; c.height = (m.h + 2 * q) * cell;
+  const ctx = c.getContext("2d", { willReadFrequently: true });
+  ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, c.width, c.height); ctx.fillStyle = "#000";
+  for (let r = 0; r < m.h; r++) for (let col = 0; col < m.w; col++) if (m.dark(r, col)) ctx.fillRect((col + q) * cell, (r + q) * cell, cell, cell);
+  const Z = await zxing(); if (!Z) return true;
+  const res = await Z.readBarcodes(ctx.getImageData(0, 0, c.width, c.height), { formats: FORMATS });
+  return res.some((r) => r.isValid && r.text === text);
+}
+
 async function handleFile(file) {
-  status("Suche QR-Code …");
+  status("Suche Code …");
   try {
     const canvases = await loadToCanvas(file);
     let found = null;
     for (const c of canvases) { found = await findQR(c); if (found) break; }
-    if (!found) { qrText = null; render(); status("Kein QR-Code gefunden. Foto näher, gerader und ohne Spiegelung aufnehmen – oder Screenshot nutzen.", true); return; }
-    qrText = found;
-    $("decoded").textContent = "Inhalt: " + found;
+    if (!found) { code = null; render(); status("Kein Code gefunden. Foto näher, gerader und ohne Spiegelung aufnehmen – oder Screenshot nutzen.", true); return; }
+    const matrix = await buildMatrix(found.text, found.format);
+    const ok = await verifyMatrix(matrix, found.text);
+    code = { ...found, matrix, carrier: detectCarrier(found.text, found.format) };
+    $("decoded").textContent = (code.carrier ? "Versand: " + code.carrier + " · " : "") + (found.format === "QRCode" ? "QR" : found.format) + "-Code · Inhalt: " + found.text;
     render();
-    status(writeCh ? "Bereit zum Drucken." : "QR erkannt. Jetzt Drucker verbinden.");
+    if (!ok) status("Achtung: Neu gezeichneter Code konnte nicht gegengeprüft werden – bitte Ausdruck mit dem Handy testen.", true);
+    else status(writeCh ? "Bereit zum Drucken." : "Code erkannt. Jetzt Drucker verbinden.");
   } catch (e) { status("Fehler beim Lesen: " + e.message, true); }
 }
 
@@ -223,22 +276,31 @@ function render() {
   const sizeMm = +$("size").value; $("sizeVal").textContent = sizeMm;
   const pct = +$("energy").value;
   $("energyVal").textContent = pct + " %" + (pct === 50 ? " (Standard)" : pct < 50 ? " – heller" : " – dunkler");
-  if (!qrText) { cv.height = 384; ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, WIDTH, 384); updateButtons(); return; }
+  if (!code) { cv.height = 384; ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, WIDTH, 384); updateButtons(); return; }
 
-  let qr = null;
-  for (const ecl of ["M", "L"]) { try { qr = qrcode(0, ecl); qr.addData(qrText); qr.make(); break; } catch (e) { qr = null; } }
-  const n = qr.getModuleCount();
+  const m = code.matrix, n = Math.max(m.w, m.h);
   const target = Math.min(WIDTH, sizeMm * DOTS_PER_MM);
-  const cell = Math.max(1, Math.floor(target / (n + 4)));   // integer dots per module, 2-module quiet zone each side
-  const qrPx = cell * n, top = 2 * cell;
+  const cell = Math.max(1, Math.floor(target / (n + 2 * m.quiet)));   // integer dots per module + quiet zone
+  const symW = cell * m.w, symH = cell * m.h, q = m.quiet * cell;
+
+  // Optional carrier banner: white text on a black bar
+  const banner = $("showCarrier").checked && code.carrier;
+  const bannerH = banner ? 64 : 0;
   const fontPx = 26, lines = caption ? wrap(ctx, caption, fontPx) : [];
-  cv.height = top + qrPx + 2 * cell + lines.length * (fontPx + 6) + (lines.length ? 8 : 0);
+  const top = bannerH + q;
+  cv.height = top + symH + q + lines.length * (fontPx + 6) + (lines.length ? 8 : 0);
   ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, WIDTH, cv.height);
-  const left = Math.floor((WIDTH - qrPx) / 2);
+  if (banner) {
+    ctx.fillStyle = "#000"; ctx.fillRect(0, 0, WIDTH, bannerH - 8);
+    ctx.fillStyle = "#fff"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    let fs = 46; do { ctx.font = `800 ${fs}px -apple-system, system-ui, sans-serif`; fs -= 2; } while (ctx.measureText(code.carrier).width > WIDTH - 24 && fs > 20);
+    ctx.fillText(code.carrier, WIDTH / 2, (bannerH - 8) / 2 + 2);
+  }
+  const left = Math.floor((WIDTH - symW) / 2);
   ctx.fillStyle = "#000";
-  for (let r = 0; r < n; r++) for (let c = 0; c < n; c++) if (qr.isDark(r, c)) ctx.fillRect(left + c * cell, top + r * cell, cell, cell);
+  for (let r = 0; r < m.h; r++) for (let c = 0; c < m.w; c++) if (m.dark(r, c)) ctx.fillRect(left + c * cell, top + r * cell, cell, cell);
   ctx.font = `600 ${fontPx}px -apple-system, system-ui, sans-serif`; ctx.textAlign = "center"; ctx.textBaseline = "top";
-  lines.forEach((l, i) => ctx.fillText(l, WIDTH / 2, top + qrPx + 2 * cell + i * (fontPx + 6)));
+  lines.forEach((l, i) => ctx.fillText(l, WIDTH / 2, top + symH + q + i * (fontPx + 6)));
   updateButtons();
 }
 function wrap(ctx, text, fontPx) {
@@ -251,7 +313,7 @@ function wrap(ctx, text, fontPx) {
   if (cur) out.push(cur);
   return out;
 }
-function updateButtons() { $("print").disabled = !(qrText && writeCh) || busy; }
+function updateButtons() { $("print").disabled = !(code && writeCh) || busy; }
 
 // ---------- Bluetooth ----------
 const SVC_FULL = "0000ae30-0000-1000-8000-00805f9b34fb";
@@ -278,7 +340,7 @@ async function connect(showAll) {
       nc.addEventListener("characteristicvaluechanged", onNotify);
     } catch (e) { /* notify optional */ }
     $("connect").textContent = "Verbunden: " + device.name;
-    status(qrText ? "Bereit zum Drucken." : "Verbunden. Jetzt Screenshot wählen.");
+    status(code ? "Bereit zum Drucken." : "Verbunden. Jetzt Screenshot wählen.");
     updateButtons();
   } catch (e) { status("Verbindung fehlgeschlagen: " + e.message, true); }
 }
@@ -311,7 +373,7 @@ async function send(bytes) {
   }
 }
 async function print() {
-  if (!writeCh || !qrText) return;
+  if (!writeCh || !code) return;
   busy = true; updateButtons(); canWrite = true;
   try {
     status("Drucke …");
@@ -326,7 +388,7 @@ $("connect").onclick = () => connect(false);
 $("connectAll").onclick = () => connect(true);
 $("print").onclick = print;
 $("file").onchange = (e) => e.target.files[0] && handleFile(e.target.files[0]);
-["caption", "size", "energy"].forEach((id) => $(id).addEventListener("input", render));
+["caption", "size", "energy", "showCarrier"].forEach((id) => $(id).addEventListener("input", render));
 window.__test = { handleFile, buildJob, findQR, loadToCanvas, energyFromPercent }; // for automated testing
 zxing(); // start loading the WASM decoder early
 render();
