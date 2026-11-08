@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>QR Paketdruck</title>
 <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/zxing-wasm@2.2.4/dist/iife/reader/index.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 <style>
@@ -49,9 +50,9 @@
 
   <div class="card">
     <div class="row">
-      <label class="file">Screenshot / PDF wählen<input id="file" type="file" accept="image/*,application/pdf"></label>
+      <label class="file">Bild / Foto / PDF wählen<input id="file" type="file" accept="image/*,application/pdf"></label>
     </div>
-    <p class="small">Screenshot vom QR-Code in der Vinted-App oder das Versand-PDF. Der QR-Code wird automatisch erkannt und scharf neu gezeichnet.</p>
+    <p class="small">Screenshot oder Foto vom QR-Code bzw. das Versand-PDF. Der QR-Code wird automatisch erkannt und scharf neu gezeichnet. Fotos: Code möglichst gerade und formatfüllend, ohne Spiegelung.</p>
     <div id="decoded" class="data"></div>
 
     <label class="f" for="caption">Text unter dem Code (optional)</label>
@@ -61,7 +62,7 @@
     <input id="size" type="range" min="25" max="48" step="1" value="48">
 
     <label class="f" for="energy">Schwärze: <span id="energyVal"></span></label>
-    <input id="energy" type="range" min="8192" max="28672" step="1024" value="12288">
+    <input id="energy" type="range" min="0" max="100" step="5" value="50">
   </div>
 
   <div class="card">
@@ -95,6 +96,8 @@ function frame(cmd, data) {
   const n = data.length;
   return [0x51, 0x78, cmd, 0x00, n & 0xff, n >> 8, ...data, crc8(data), 0xff];
 }
+// 0 % = 0x1000 (very light), 50 % = 0x3000 (tested default), 100 % = 0x5000 (dark)
+const energyFromPercent = (p) => Math.round(0x1000 + (p / 100) * 0x4000);
 function buildJob(canvas, energy) {
   const ctx = canvas.getContext("2d");
   const { data } = ctx.getImageData(0, 0, WIDTH, canvas.height);
@@ -143,22 +146,59 @@ async function loadToCanvas(file) {
     }
     return pages;
   }
-  const img = await createImageBitmap(file);
+  let img;
+  try { img = await createImageBitmap(file, { imageOrientation: "from-image" }); }
+  catch (e) { // fallback for formats createImageBitmap can't handle (e.g. HEIC in some WebViews)
+    img = await new Promise((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = () => rej(new Error("Bildformat nicht lesbar")); i.src = URL.createObjectURL(file); });
+  }
   c.width = img.width; c.height = img.height; ctx.drawImage(img, 0, 0);
   return [c];
 }
-function findQR(canvas) {
-  // try full image, then downscaled versions (jsQR is faster/more robust on moderate sizes)
-  for (const maxSide of [0, 1600, 1000, 700]) {
-    let c = canvas;
-    if (maxSide && Math.max(canvas.width, canvas.height) > maxSide) {
-      const s = maxSide / Math.max(canvas.width, canvas.height);
-      c = document.createElement("canvas"); c.width = Math.round(canvas.width * s); c.height = Math.round(canvas.height * s);
-      c.getContext("2d").drawImage(canvas, 0, 0, c.width, c.height);
-    } else if (maxSide) continue;
-    const d = c.getContext("2d", { willReadFrequently: true }).getImageData(0, 0, c.width, c.height);
-    const r = jsQR(d.data, d.width, d.height, { inversionAttempts: "attemptBoth" });
-    if (r && r.data) return r.data;
+
+// Region of `src` (fractions x,y,w,h) scaled so its longest side is <= maxSide.
+function sub(src, fx, fy, fw, fh, maxSide) {
+  const sw = src.width * fw, sh = src.height * fh;
+  const s = Math.min(1, maxSide / Math.max(sw, sh));
+  const c = document.createElement("canvas");
+  c.width = Math.max(1, Math.round(sw * s)); c.height = Math.max(1, Math.round(sh * s));
+  const ctx = c.getContext("2d", { willReadFrequently: true });
+  ctx.imageSmoothingQuality = "high";
+  ctx.drawImage(src, src.width * fx, src.height * fy, sw, sh, 0, 0, c.width, c.height);
+  return ctx.getImageData(0, 0, c.width, c.height);
+}
+const CROPS = [[0, 0, 1, 1], [0.15, 0.15, 0.7, 0.7], [0.25, 0.25, 0.5, 0.5]];
+
+let zxingReady = null;
+function zxing() {
+  if (!zxingReady && window.ZXingWASM) {
+    ZXingWASM.prepareZXingModule({
+      overrides: { locateFile: (p, prefix) => p.endsWith(".wasm") ? "https://cdn.jsdelivr.net/npm/zxing-wasm@2.2.4/dist/reader/zxing_reader.wasm" : prefix + p },
+    });
+    zxingReady = Promise.resolve(ZXingWASM);
+  }
+  return zxingReady;
+}
+async function findQR(canvas) {
+  // 1) zxing-cpp (WASM): robust against perspective, blur, glare and big photos
+  try {
+    const Z = await zxing();
+    if (Z) {
+      for (const maxSide of [2000, 1200, 3000]) {
+        for (const [x, y, w, h] of CROPS) {
+          const res = await Z.readBarcodes(sub(canvas, x, y, w, h, maxSide), { formats: ["QRCode"], tryHarder: true, tryRotate: true, tryInvert: true, maxNumberOfSymbols: 1 });
+          const hit = res.find((r) => r.isValid && r.text);
+          if (hit) return hit.text;
+        }
+      }
+    }
+  } catch (e) { console.warn("zxing failed, falling back to jsQR", e); }
+  // 2) jsQR fallback on several sizes and centre crops
+  for (const maxSide of [1000, 700, 1400, 500]) {
+    for (const [x, y, w, h] of CROPS) {
+      const d = sub(canvas, x, y, w, h, maxSide);
+      const r = jsQR(d.data, d.width, d.height, { inversionAttempts: "attemptBoth" });
+      if (r && r.data) return r.data;
+    }
   }
   return null;
 }
@@ -167,8 +207,8 @@ async function handleFile(file) {
   try {
     const canvases = await loadToCanvas(file);
     let found = null;
-    for (const c of canvases) { found = findQR(c); if (found) break; }
-    if (!found) { qrText = null; render(); status("Kein QR-Code gefunden. Screenshot näher am Code versuchen.", true); return; }
+    for (const c of canvases) { found = await findQR(c); if (found) break; }
+    if (!found) { qrText = null; render(); status("Kein QR-Code gefunden. Foto näher, gerader und ohne Spiegelung aufnehmen – oder Screenshot nutzen.", true); return; }
     qrText = found;
     $("decoded").textContent = "Inhalt: " + found;
     render();
@@ -181,7 +221,8 @@ function render() {
   const cv = $("preview"), ctx = cv.getContext("2d");
   const caption = $("caption").value.trim();
   const sizeMm = +$("size").value; $("sizeVal").textContent = sizeMm;
-  $("energyVal").textContent = "0x" + (+$("energy").value).toString(16);
+  const pct = +$("energy").value;
+  $("energyVal").textContent = pct + " %" + (pct === 50 ? " (Standard)" : pct < 50 ? " – heller" : " – dunkler");
   if (!qrText) { cv.height = 384; ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, WIDTH, 384); updateButtons(); return; }
 
   let qr = null;
@@ -274,7 +315,7 @@ async function print() {
   busy = true; updateButtons(); canWrite = true;
   try {
     status("Drucke …");
-    await send(buildJob($("preview"), +$("energy").value));
+    await send(buildJob($("preview"), energyFromPercent(+$("energy").value)));
     status("Gedruckt.");
   } catch (e) { status("Druckfehler: " + e.message, true); }
   busy = false; updateButtons();
@@ -286,7 +327,8 @@ $("connectAll").onclick = () => connect(true);
 $("print").onclick = print;
 $("file").onchange = (e) => e.target.files[0] && handleFile(e.target.files[0]);
 ["caption", "size", "energy"].forEach((id) => $(id).addEventListener("input", render));
-window.__test = { handleFile, buildJob }; // for automated testing
+window.__test = { handleFile, buildJob, findQR, loadToCanvas, energyFromPercent }; // for automated testing
+zxing(); // start loading the WASM decoder early
 render();
 </script>
 </body>
