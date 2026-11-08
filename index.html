@@ -44,7 +44,7 @@
     <div class="row" style="margin-top:8px">
       <button id="connectAll" class="secondary">Alle Geräte anzeigen</button>
     </div>
-    <p class="small">Taucht der Drucker nicht auf? „Alle Geräte anzeigen“ nutzen und „MX06“ (oder ein unbenanntes Gerät) wählen.</p>
+    <p class="small">„Drucker verbinden“ zeigt nur Drucker (Name beginnt mit „MX“). Der zuletzt genutzte Drucker wird gemerkt. Nur falls er dort nicht auftaucht: „Alle Geräte anzeigen“ und „MX06“ wählen.</p>
     <div id="status">Nicht verbunden.</div>
   </div>
 
@@ -317,18 +317,50 @@ function updateButtons() { $("print").disabled = !(code && writeCh) || busy; }
 
 // ---------- Bluetooth ----------
 const SVC_FULL = "0000ae30-0000-1000-8000-00805f9b34fb";
+const store = {
+  get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch (e) { /* private mode */ } },
+};
+const withTimeout = (p, ms) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error("Zeitüberschreitung")), ms))]);
+let skipRemembered = false;
+
 async function connect(showAll) {
   if (!navigator.bluetooth) { status("Dieser Browser kann kein Bluetooth. Auf dem iPhone die App „Bluefy“ nutzen.", true); return; }
+  // 1) Reconnect to the remembered printer without showing a list (if the browser supports getDevices)
+  const lastName = store.get("printerName");
+  if (!showAll && !skipRemembered && lastName && navigator.bluetooth.getDevices) {
+    try {
+      const known = (await navigator.bluetooth.getDevices()).find((d) => d.name === lastName);
+      if (known) {
+        status("Verbinde mit " + known.name + " …");
+        await withTimeout(setupDevice(known), 8000);
+        return;
+      }
+    } catch (e) {
+      skipRemembered = true;
+      status(`${lastName} nicht erreichbar (an? Fun Print geschlossen?). Nochmal tippen für die Geräteliste.`, true);
+      return;
+    }
+  }
+  // 2) Device chooser – a single filter, because some browsers (Bluefy) handle multiple filters differently
   try {
     status("Wähle den Drucker …");
-    device = await navigator.bluetooth.requestDevice(showAll === true
+    const prefix = (lastName || "MX").slice(0, 2);
+    const dev = await navigator.bluetooth.requestDevice(showAll === true
       ? { acceptAllDevices: true, optionalServices: [SVC_FULL] }
-      : {
-          filters: [{ namePrefix: "MX" }, { namePrefix: "GT" }, { namePrefix: "YT" }, { namePrefix: "GB" }, { services: [SVC_FULL] }],
-          optionalServices: [SVC_FULL],
-        });
-    device.addEventListener("gattserverdisconnected", () => { writeCh = null; status("Verbindung getrennt."); $("connect").textContent = "Drucker verbinden"; updateButtons(); });
-    status("Verbinde mit " + device.name + " …");
+      : { filters: [{ namePrefix: prefix }], optionalServices: [SVC_FULL] });
+    status("Verbinde mit " + dev.name + " …");
+    await setupDevice(dev);
+  } catch (e) {
+    if (e.name === "NotFoundError") status("Kein Drucker gewählt. Taucht er nicht auf? „Alle Geräte anzeigen“ nutzen.", true);
+    else status("Verbindung fehlgeschlagen: " + e.message, true);
+  }
+}
+
+async function setupDevice(dev) {
+  {
+    device = dev;
+    if (!dev.__hooked) dev.__hooked = true, device.addEventListener("gattserverdisconnected", () => { writeCh = null; status("Verbindung getrennt."); $("connect").textContent = "Drucker verbinden"; updateButtons(); });
     const server = await device.gatt.connect();
     let svc;
     try { svc = await server.getPrimaryService(SVC_FULL); }
@@ -340,9 +372,11 @@ async function connect(showAll) {
       nc.addEventListener("characteristicvaluechanged", onNotify);
     } catch (e) { /* notify optional */ }
     $("connect").textContent = "Verbunden: " + device.name;
-    status(code ? "Bereit zum Drucken." : "Verbunden. Jetzt Screenshot wählen.");
+    if (device.name) store.set("printerName", device.name);
+    skipRemembered = false;
+    status(code ? "Bereit zum Drucken." : "Verbunden. Jetzt Bild wählen.");
     updateButtons();
-  } catch (e) { status("Verbindung fehlgeschlagen: " + e.message, true); }
+  }
 }
 function onNotify(ev) {
   const v = new Uint8Array(ev.target.value.buffer);
